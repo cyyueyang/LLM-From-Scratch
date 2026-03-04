@@ -48,6 +48,9 @@ class SimpleTokenizer:
             self.vocab[new_id] = self.vocab[pair[0]] + self.vocab[pair[1]]
 
     def encode(self, text: str) -> List[int]:
+        """
+        将字符串编码为 int 序列
+        """
         tokens = list(text.encode("utf-8"))
         while len(tokens) >= 2:
             stats = get_stats(tokens)
@@ -64,6 +67,7 @@ class SimpleTokenizer:
         return tokens
 
     def decode(self, ids: List[int]) -> str:
+        """解码"""
         tokens = b"".join(self.vocab[idx] for idx in ids)
         return tokens.decode("utf-8", errors="replace")
 
