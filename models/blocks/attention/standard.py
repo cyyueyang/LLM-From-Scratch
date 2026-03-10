@@ -2,16 +2,16 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 import math
-
-from fontTools.unicodedata import block
+from typing import Tuple
 
 from ..positional_encoding.positional_encoding import RoPE
+from inference.engine.kv_cache import StandardKVCache, LatentKVCache
+from ..normalization.normalization import RMSNorm
 
 import sys
 from pathlib import Path
 project_dir = Path(__file__).parent.parent.parent
 sys.path.append(str(project_dir))
-from inference.engine.kv_cache import StandardKVCache, LatentKVCache
 
 
 class StandardAttention(nn.Module):
@@ -171,6 +171,190 @@ class StandardAttention(nn.Module):
         output_flat = output.view(-1, self.n_heads * self.head_dim)
 
         return self.w_o(output_flat)
+
+
+class MultiHeadLatentAttention(nn.Module):
+    def __init__(self, args):
+        super(MultiHeadLatentAttention, self).__init__()
+
+        self.q_lora_rank = args.q_lora_rank
+        self.kv_lora_rank = args.kv_lora_rank
+
+        self.n_heads = args.n_heads
+        self.d_model = args.d_model
+        self.nope_head_dim = args.nope_head_dim
+        self.rope_head_dim = args.rope_head_dim
+        self.v_head_dim = args.v_head_dim
+
+        if self.q_lora_rank > 0:
+            self.wq_down = nn.Linear(self.d_model, self.q_lora_rank, bias=False)
+            self.wq_up = nn.Linear(self.q_lora_rank, self.n_heads * self.nope_head_dim, bias=False)
+            self.wq_rope = nn.Linear(self.q_lora_rank, self.n_heads * self.rope_head_dim, bias=False)
+            self.q_norm = RMSNorm(self.q_lora_rank, eps=args.norm_eps)
+
+        else:
+            self.wq_up = nn.Linear(self.d_model, self.n_heads * self.nope_head_dim, bias=False)
+            self.wq_rope = nn.Linear(self.d_model, self.n_heads * self.rope_head_dim, bias=False)
+
+        self.wkv_down = nn.Linear(self.d_model, self.kv_lora_rank, bias=False)
+        self.kv_norm = RMSNorm(self.kv_lora_rank, eps=args.norm_eps)
+
+        self.wkv_up = nn.Linear(self.kv_lora_rank, self.n_heads * (self.nope_head_dim + self.v_head_dim), bias=False)
+
+        self.wk_rope = nn.Linear(self.d_model, self.rope_head_dim, bias=False)
+
+        self.wo = nn.Linear(self.n_heads * self.v_head_dim, self.d_model, bias=False)
+
+        mask = torch.ones((1, 1, args.max_seq_len, args.max_seq_len), dtype=torch.bool)
+        mask = torch.tril(mask)
+        self.register_buffer("mask", mask)
+
+    def forward(self,
+                x: torch.Tensor,
+                rope: RoPE,
+                layer_idx: int,
+                kv_cache: LatentKVCache,
+                start_pos: int = 0,
+                paged_attention_inputs: Tuple[torch.Tensor, ...] = None) -> torch.Tensor:
+        bs, seq_len, _ = x.size()
+
+        if seq_len == 1 and kv_cache is not None:
+            return self._forward_inference_optimized(x, rope, layer_idx, kv_cache, start_pos)
+
+        if paged_attention_inputs is not None:
+            raise NotImplementedError
+        # 这部分 只用于 prefill or training
+        if self.q_lora_rank > 0:
+            q_compressed = self.q_norm(self.wq_down(x))
+            q_nope = self.wq_up(q_compressed).view(bs, seq_len, self.n_heads, self.nope_head_dim)
+            q_rope = self.wq_rope(q_compressed).view(bs, seq_len, self.n_heads, self.rope_head_dim)
+        else:
+            q_nope = self.wq_up(x).view(bs, seq_len, self.n_heads, self.nope_head_dim)
+            q_rope = self.wq_rope(x).view(bs, seq_len, self.n_heads, self.rope_head_dim)
+
+        kv_compressed = self.kv_norm(self.wkv_down(x))
+
+        kv_up = self.wkv_up(kv_compressed).view(bs, seq_len, self.n_heads, self.nope_head_dim + self.v_head_dim)
+        k_nope, v = torch.split(kv_up, [self.nope_head_dim, self.v_head_dim], dim=-1)
+
+        k_rope_shared = self.wk_rope(x).view(bs, seq_len, 1, self.rope_head_dim)
+
+        if kv_cache is not None:
+            k_rope_for_cache = k_rope_shared.squeeze(2)
+            kv_cache.update(layer_idx, start_pos, kv_compressed, k_rope_for_cache)
+
+        q_rope = q_rope.transpose(1, 2)
+        q_rope = rope.apply_rotary_emb(q_rope)
+
+        k_rope_shared = k_rope_shared.transpose(1, 2)
+        k_rope_shared = rope.apply_rotary_emb(k_rope_shared)
+
+        k_rope = k_rope_shared.expand(-1, self.n_heads, -1, -1)
+
+        q_nope = q_nope.transpose(1, 2)
+        k_nope = k_nope.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        q = torch.cat([q_nope, q_rope], dim=-1)
+        k = torch.cat([k_nope, k_rope], dim=-1)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.nope_head_dim + self.rope_head_dim)
+
+        if seq_len > 1:
+            mask = self.mask[:, :, :seq_len, :seq_len]
+            scores = scores.masked_fill(~mask, -1e9)
+
+        probs = F.softmax(scores.float(), dim=-1).type_as(x)
+        output = torch.matmul(probs, v)
+        output = output.transpose(1, 2).contiguous().view(bs, seq_len, -1)
+        return self.wo(output)
+
+    def _forward_inference_optimized(self,
+                                     x: torch.Tensor,
+                                     rope: RoPE,
+                                     layer_idx: int,
+                                     kv_cache: LatentKVCache,
+                                     start_pos: int = 0) -> torch.Tensor:
+        bs, seq_len, _ = x.size()
+        assert seq_len == 1
+
+        if self.q_lora_rank > 0:
+            q_compressed = self.q_norm(self.wq_down(x))
+            q_nope = self.wq_up(q_compressed).view(bs, seq_len, self.n_heads, self.nope_head_dim)
+            q_rope = self.wq_rope(q_compressed).view(bs, seq_len, self.n_heads, self.rope_head_dim)
+        else:
+            q_nope = self.wq_up(x).view(bs, seq_len, self.n_heads, self.nope_head_dim)
+            q_rope = self.wq_rope(x).view(bs, seq_len, self.n_heads, self.rope_head_dim)
+
+        kv_compressed = self.kv_norm(self.wkv_down(x))
+
+        k_rope_shared = self.wk_rope(x).view(bs, seq_len, self.rope_head_dim)
+
+        positions = torch.arange(start_pos, start_pos + seq_len, device=x.device, dtype=torch.long)
+        positions = positions.unsqueeze(0).expand(bs, -1).flatten()
+
+        q_rope_flat = q_rope.view(bs * seq_len, self.n_heads, self.rope_head_dim)
+        q_rope_out = rope.apply_rotary_emb_paged(q_rope_flat, positions)
+        q_rope = q_rope_out.view(bs, seq_len, self.n_heads, self.rope_head_dim).transpose(1, 2)
+
+        k_rope_flat = k_rope_shared.view(bs * seq_len, 1, self.rope_head_dim)
+        k_rope_out = rope.apply_rotary_emb_paged(k_rope_flat, positions)
+        k_rope_shared = k_rope_out.view(bs, seq_len, self.rope_head_dim)
+
+        full_c_kv, full_k_rope = kv_cache.update(layer_idx, start_pos, kv_compressed, k_rope_shared)
+
+        k_rope_hist_heads = full_k_rope.unsqueeze(1)
+        score_pe = torch.matmul(q_rope, k_rope_hist_heads.transpose(-2, -1))
+
+        w_up_weight = None
+        if hasattr(self.wkv_up, '_packed_params'):
+            if hasattr(self.wkv_up._packed_params, 'unpack'):
+                w_up_weight, _ = self.wkv_up._packed_params.unpack()
+
+            else:
+                try:
+                    w_up_weight, _ = torch.ops.quantized.linear_unpack(self.wkv_up._packed_params)
+
+                except Exception as e:
+                    raise RuntimeError(f"Failed to unpacked quantized weight {e}")
+
+        else:
+            w_up_weight = self.wkv_up.weight
+
+        head_dim_total = self.nope_head_dim + self.v_head_dim
+        w_up_weight = w_up_weight.view(self.n_heads, head_dim_total, self.kv_lora_rank)
+
+        w_uk = w_up_weight[:, :self.nope_head_dim, :]
+        w_uv = w_up_weight[:, self.nope_head_dim:, :]
+
+        q_nope_heads = q_nope.transpose(1, 2)
+
+        q_absorbed = torch.einsum('b h t d, h d r -> b h t r', q_nope_heads, w_uk)
+
+        score_nope = torch.matmul(q_absorbed, full_c_kv.transpose(1, 2).unsqueeze(1))
+
+        scores = (score_nope + score_pe) / math.sqrt(self.nope_head_dim + self.rope_head_dim)
+
+        probs = F.softmax(scores.float(), dim=-1).type_as(x)
+
+        latent_output = torch.matmul(probs, full_c_kv.unsqueeze(1))
+
+        output = torch.einsum('b h t r, h v r -> b h t v', latent_output, w_uv)
+
+        output = output.transpose(1, 2).contiguous().view(bs, seq_len, -1)
+        return self.wo(output)
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
