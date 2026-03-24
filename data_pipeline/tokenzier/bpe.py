@@ -57,7 +57,7 @@ class SimpleTokenizer:
 
         while True:
             stats = get_stats(ids)
-            if stats is None:
+            if not stats:
                 break
 
             pair = min(stats, key=lambda x: self.merges.get(x, float("inf")))
@@ -100,7 +100,7 @@ class RegexTokenizer:
 
         for i in pbar:
             stats = get_stats(ids)
-            if stats is None:
+            if not stats:
                 break
 
             pair = max(stats, key=stats.get)
