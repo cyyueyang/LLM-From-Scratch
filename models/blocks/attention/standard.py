@@ -318,7 +318,7 @@ class MultiHeadLatentAttention(nn.Module):
 
         full_c_kv, full_k_rope = kv_cache.update(layer_idx, start_pos, kv_compressed, k_rope_shared)
 
-        k_rope = k_rope_shared.unsqueeze(1)
+        k_rope = full_k_rope.unsqueeze(1)
         # 计算s_pe
         score_pe = torch.matmul(q_pe, k_rope.transpose(-2, -1))
 
@@ -339,7 +339,7 @@ class MultiHeadLatentAttention(nn.Module):
             # 标准 nn.Linear
             w_up_weight = self.wkv_up.weight
 
-        head_dim_total = self.nope_head_dim + self.rope_head_dim
+        head_dim_total = self.nope_head_dim + self.v_head_dim
 
         w_up_reshaped = w_up_weight.view(self.n_heads, head_dim_total, self.kv_lora_rank)
 
@@ -350,7 +350,7 @@ class MultiHeadLatentAttention(nn.Module):
         q_absorbed = torch.einsum("b h t d, h d r -> b h t r", q_nope, w_uk)
         scores_nope = torch.matmul(q_absorbed, full_c_kv.transpose(-2, -1).unsqueeze(1))
 
-        scores = (scores_nope + score_pe) / math.sqrt(head_dim_total)
+        scores = (scores_nope + score_pe) / math.sqrt(self.nope_head_dim + self.rope_head_dim)
 
         probs = torch.softmax(scores.float(), dim=-1).type_as(x)
 
